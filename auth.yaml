@@ -1,0 +1,38 @@
+# credentials:
+#   usernames:
+#     admin:
+#       email: admin@example.com
+#       name: Admin User
+#       password: "$2b$12$KIXQ..." # hashed password
+
+cookie:
+  expiry_days: 30
+  key: some_signature_key
+  name: some_cookie_name
+
+preauthorized:
+  emails:
+    - admin@example.com
+
+credentials:
+  usernames:
+    devanshu:
+      email: devanshu@example.com
+      name: Devanshu
+      password: "$2b$12$BSxI7nw1rMjBmRWzYn2wv.xsGEGuI.7OriYC3iPTojSNjpUn94BcS"  
+
+credentials:
+  usernames:
+    hanuman:
+      email: hanuman@example.com
+      name: Hanuman
+      password: "$2b$12$v/ktIpMn0X9iCuoaSBJXhO4lRc/n/8hoBvpOKfzMOVdnVMF6ENImm"  
+
+cookie:
+  expiry_days: 30
+  key: "rag_app_secret_key"
+  name: "rag_cookie"
+
+preauthorized:
+  emails:
+    - devanshu@example.com
