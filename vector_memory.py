@@ -44,15 +44,46 @@ class VectorMemoryStore:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _validate_user_id(user_id: str) -> None:
+        """
+        Raise ValueError for blank or guest user_ids.
+
+        Guest users must never access the vector store — they have
+        no persistent identity and no right to read any user's memories.
+        """
+        if not user_id or not user_id.strip():
+            raise ValueError("[VectorMemoryStore] user_id must not be empty.")
+        if user_id.startswith("guest_"):
+            raise ValueError(
+                f"[VectorMemoryStore] Guest users are not permitted to access "
+                f"vector memory (user_id={user_id!r})."
+            )
+
     def _get_collection(self, user_id: str) -> chromadb.Collection:
-        """Get or create the user-specific vector memory collection."""
+        """
+        Get or create the user-specific vector memory collection.
+
+        Each user gets a *dedicated, isolated* collection whose name is
+        derived deterministically from their user_id.  No cross-user
+        access is possible because every query/store call goes through
+        this method which enforces the user_id binding.
+        """
+        self._validate_user_id(user_id)
         if user_id not in self._collections:
-            collection_name = f"user_memory_{user_id}"
-            # ChromaDB collection names: 3-63 chars, alphanumeric + underscores
-            collection_name = collection_name[:63]
+            # Sanitise user_id for ChromaDB collection name rules:
+            # 3-63 chars, alphanumeric + underscores/hyphens, no leading/trailing hyphens
+            safe_uid = "".join(
+                c if c.isalnum() or c in ("_", "-") else "_"
+                for c in user_id
+            )
+            collection_name = f"umem_{safe_uid}"[:63]
             self._collections[user_id] = self._chroma.get_or_create_collection(
                 name=collection_name,
-                metadata={"description": f"Long-term conversation memory for {user_id}"},
+                metadata={
+                    "owner_user_id": user_id,   # recorded for audit / cleanup
+                    "description": f"Isolated long-term memory for user: {user_id}",
+                },
             )
         return self._collections[user_id]
 
@@ -75,6 +106,8 @@ class VectorMemoryStore:
         if not pairs:
             return 0
 
+        # Raises if user_id is blank or a guest — enforced before any DB access
+        self._validate_user_id(user_id)
         collection = self._get_collection(user_id)
 
         documents:  List[str]            = []
@@ -124,7 +157,20 @@ class VectorMemoryStore:
         Returns a formatted string block for injection into the system prompt,
         or an empty string if nothing relevant was found.
         """
+        # Guard: reject guests and blank ids — no cross-user reads allowed
+        self._validate_user_id(user_id)
         collection = self._get_collection(user_id)
+
+        # Ownership check: the collection's metadata must match this user_id.
+        # This prevents a logic error elsewhere in the app from accidentally
+        # returning one user's memories to another.
+        owner = (collection.metadata or {}).get("owner_user_id", "")
+        if owner and owner != user_id:
+            print(
+                f"[VectorMemoryStore.retrieve] SECURITY: user_id={user_id!r} tried "
+                f"to read collection owned by {owner!r}. Blocked."
+            )
+            return ""
 
         # If the collection is empty, skip
         if collection.count() == 0:
@@ -167,9 +213,10 @@ class VectorMemoryStore:
     # ── Stats ─────────────────────────────────────────────────────────────────
 
     def stats(self, user_id: str) -> Dict[str, int]:
-        """Return the number of stored memories for a user."""
+        """Return the number of stored memories for this user only."""
         try:
+            self._validate_user_id(user_id)
             collection = self._get_collection(user_id)
             return {"stored_memories": collection.count()}
-        except Exception:
+        except (ValueError, Exception):
             return {"stored_memories": 0}

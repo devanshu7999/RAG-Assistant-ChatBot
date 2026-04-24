@@ -27,6 +27,24 @@ def _ensure_dir() -> None:
     os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
 
 
+def _assert_non_guest(user_id: str, operation: str = "access") -> None:
+    """
+    Raise ValueError if the caller tries to use a guest id as a real user_id.
+
+    Guest sessions are stored under guest_<thread_id>.json and managed by
+    the separate save_guest_session / load_guest_session functions.
+    A real user's file must NEVER be keyed on a guest id — that would allow
+    one session to read or overwrite another user's chat history.
+    """
+    if not user_id or not user_id.strip():
+        raise ValueError(f"[chat_store.{operation}] user_id must not be empty.")
+    if user_id.startswith("guest_"):
+        raise ValueError(
+            f"[chat_store.{operation}] Guest ids are not allowed as user_id. "
+            f"Use save_guest_session / load_guest_session instead."
+        )
+
+
 def _safe_filename(identifier: str) -> str:
     """Sanitise an identifier for safe filesystem use."""
     return "".join(c if c.isalnum() or c in ("_", "-") else "_" for c in identifier)
@@ -49,7 +67,10 @@ def load_chat_history(user_id: str) -> List[Dict[str, Any]]:
     Returns an empty list if no history exists yet.
 
     Each entry: {"thread_id": str, "name": str, "messages": [...]}
+
+    Raises ValueError if user_id is blank or a guest pseudo-id.
     """
+    _assert_non_guest(user_id, "load_chat_history")
     _ensure_dir()
     path = _user_file(user_id)
     if not os.path.exists(path):
@@ -69,7 +90,10 @@ def save_chat_history(user_id: str, history: List[Dict[str, Any]]) -> None:
     """
     Save a user's chat history to disk.
     Overwrites the existing file completely.
+
+    Raises ValueError if user_id is blank or a guest pseudo-id.
     """
+    _assert_non_guest(user_id, "save_chat_history")
     _ensure_dir()
     path = _user_file(user_id)
     try:

@@ -1,12 +1,14 @@
 # Streamlit UI and session management
 # Features:
 #   - Persistent per-user chat history (survives logout/restart)
+#   - Signup page: new users register and are written to Postgres + auth.yaml
 #   - Guest Chat → Personal Account transfer on login
 #   - Sidebar with named past chats
 #   - Rename past chats inline
 #   - Thread ID updates to show the active/viewed chat's thread
 #   - Preview/expander for every memory layer
 #   - Guest mode with Buffer Window Memory only
+#   - Strict per-user memory isolation (user_id column in every DB table)
 
 import streamlit as st
 import os
@@ -23,28 +25,154 @@ from chat_store import (
     delete_guest_session,
     transfer_guest_to_user,
 )
+import user_db  # PostgreSQL user management
 
 st.set_page_config(page_title="RAG Assistant", layout="wide")
 
-# Sequential chat name generator 
+# ── Sequential chat name generator ───────────────────────────────────────────
 def _next_chat_name() -> str:
     """Return sequential name: Chat 1, Chat 2, … based on history length."""
     n = len(st.session_state.get("chat_history", [])) + 1
     return f"Chat {n}"
 
 
-# Authentication 
-with open('auth.yaml') as file:
-    config = yaml.load(file, Loader=SafeLoader)
+# ── DB + auth.yaml bootstrap ─────────────────────────────────────────────────
+# Ensure PostgreSQL schema exists on first run.
+user_db.init_db()
+
+
+def _build_auth_config() -> dict:
+    """
+    Build the streamlit-authenticator config dict by merging auth.yaml
+    (static/seeded users) with live users from Postgres.
+
+    The Postgres DB is the source of truth for dynamically-registered users.
+    auth.yaml is used only for pre-seeded / admin accounts.
+    """
+    # Load base yaml (pre-seeded users like batman/hanuman)
+    try:
+        with open("auth.yaml") as f:
+            config = yaml.load(f, Loader=SafeLoader)
+    except FileNotFoundError:
+        config = {
+            "credentials": {"usernames": {}},
+            "cookie": {
+                "expiry_days": 30,
+                "key": "rag_app_secret_key",
+                "name": "rag_cookie",
+            },
+            "preauthorized": {"emails": []},
+        }
+
+    # Merge Postgres users into credentials (Postgres wins on conflict)
+    db_users = user_db.get_all_users_for_auth_yaml()
+    for u in db_users:
+        config["credentials"]["usernames"][u["user_id"]] = {
+            "email":    u["email"],
+            "name":     u["display_name"],
+            "password": u["password_hash"],
+        }
+    return config
+
+
+# ── Signup page ───────────────────────────────────────────────────────────────
+def _show_signup_page() -> None:
+    """
+    Render the self-service registration form.
+
+    On success:
+      • Inserts the new user into Postgres (users table, user_id column).
+      • Flips st.session_state.page back to 'login' so the user can sign in.
+    """
+    st.title("📝 Create an Account")
+    st.caption("Fill in the details below to register.")
+
+    with st.form("signup_form", clear_on_submit=False):
+        new_username    = st.text_input("Username", placeholder="e.g. alice123")
+        new_name        = st.text_input("Display Name", placeholder="e.g. Alice")
+        new_email       = st.text_input("Email", placeholder="alice@example.com")
+        new_password    = st.text_input("Password", type="password")
+        confirm_password = st.text_input("Confirm Password", type="password")
+        submitted       = st.form_submit_button("Register", use_container_width=True)
+
+    if submitted:
+        # ── Validation ────────────────────────────────────────────────────────
+        errors = []
+        new_username = new_username.strip().lower()
+        new_email    = new_email.strip().lower()
+
+        if not new_username:
+            errors.append("Username is required.")
+        elif len(new_username) < 3:
+            errors.append("Username must be at least 3 characters.")
+        elif not new_username.isalnum():
+            errors.append("Username may only contain letters and numbers.")
+
+        if not new_name.strip():
+            errors.append("Display name is required.")
+        if not new_email or "@" not in new_email:
+            errors.append("A valid email address is required.")
+        if len(new_password) < 6:
+            errors.append("Password must be at least 6 characters.")
+        if new_password != confirm_password:
+            errors.append("Passwords do not match.")
+
+        if not errors:
+            if user_db.user_exists(new_username):
+                errors.append(f"Username '{new_username}' is already taken.")
+            if user_db.email_exists(new_email):
+                errors.append(f"Email '{new_email}' is already registered.")
+
+        if errors:
+            for e in errors:
+                st.error(e)
+            return
+
+        # ── Persist to Postgres ───────────────────────────────────────────────
+        hashed = stauth.Hasher.hash(new_password)
+        ok = user_db.create_user(
+            user_id=new_username,
+            email=new_email,
+            display_name=new_name.strip(),
+            password_hash=hashed,
+        )
+
+        if ok:
+            st.success(
+                f"✅ Account created for **{new_name.strip()}** (`{new_username}`)! "
+                "You can now log in."
+            )
+            st.session_state.page = "login"
+            st.rerun()
+        else:
+            st.error("Registration failed. Please try again.")
+
+    st.divider()
+    if st.button("← Back to Login"):
+        st.session_state.page = "login"
+        st.rerun()
+
+
+# ── Page routing ──────────────────────────────────────────────────────────────
+if "page" not in st.session_state:
+    st.session_state.page = "login"
+
+if st.session_state.page == "signup":
+    _show_signup_page()
+    st.stop()
+
+# ── Authentication (login page) ───────────────────────────────────────────────
+config = _build_auth_config()
 
 authenticator = stauth.Authenticate(
-    config['credentials'],
-    config['cookie']['name'],
-    config['cookie']['key'],
-    config['cookie']['expiry_days']
+    config["credentials"],
+    config["cookie"]["name"],
+    config["cookie"]["key"],
+    config["cookie"]["expiry_days"],
 )
 
 authenticator.login()
+
 
 # Shared engine (created once, shared between guest and auth) 
 if "engine" not in st.session_state:
@@ -57,14 +185,19 @@ if st.session_state["authentication_status"]:
 
     user_id: str = st.session_state.get("username") or "default"
 
+    # Stamp last_login in Postgres for this user
+    user_db.update_last_login(user_id)
+
     # Load persistent chat history from disk on first run 
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = load_chat_history(user_id)
 
-    # If user changed (different account), reload their history
+    # If user changed (different account), reload their history AND their chunks
     if st.session_state.get("_loaded_user_id") != user_id:
         st.session_state.chat_history = load_chat_history(user_id)
         st.session_state["_loaded_user_id"] = user_id
+        # Restore only this user's previously-indexed documents
+        engine.load_session_data(user_id)
 
     if "thread_id" not in st.session_state:
         st.session_state.thread_id = str(uuid.uuid4())
@@ -102,8 +235,14 @@ if st.session_state["authentication_status"]:
                 except Exception:
                     pass
 
+        # Always purge any guest-indexed chunks from ChromaDB so the logged-in
+        # user starts with only their own previously-indexed documents.
+        if guest_tid:
+            engine.clear_guest_data(guest_tid)
+
         # Clean up guest session state regardless
-        for key in ("guest_thread_id", "guest_messages"):
+        for key in ("guest_thread_id", "guest_messages",
+                    "_guest_pending_pdf_name", "_guest_pending_pdf_bytes"):
             if key in st.session_state:
                 del st.session_state[key]
 
@@ -120,12 +259,15 @@ if st.session_state["authentication_status"]:
         if not msgs:
             return False
         name = _next_chat_name()
+        tid  = st.session_state.thread_id
         st.session_state.chat_history.insert(0, {
-            "thread_id": st.session_state.thread_id,
+            "thread_id": tid,
             "name":      name,
             "messages":  list(msgs),
         })
         save_chat_history(user_id, st.session_state.chat_history)
+        # Also record in Postgres per-user conversation index
+        user_db.save_conversation(user_id, tid, title=name)
         return True
 
     def _save_history() -> None:
@@ -238,7 +380,7 @@ if st.session_state["authentication_status"]:
                     st.rerun()
 
         st.divider()
-        st.caption(f"Thread: `{display_thread_id[:16]}…`")
+        st.caption(f"Thread: `{display_thread_id}`")
         st.divider()
 
         
@@ -361,7 +503,11 @@ if st.session_state["authentication_status"]:
                     temp_path = f"temp_{pending_name}"
                     with open(temp_path, "wb") as f:
                         f.write(pending_bytes)
-                    engine.process_pdf(temp_path, doc_name=pending_name)
+                    engine.process_pdf(
+                        temp_path,
+                        doc_name=pending_name,
+                        session_id=user_id,   # tag chunks with the user's id
+                    )
                     os.remove(temp_path)
                     del st.session_state["_pending_pdf_name"]
                     del st.session_state["_pending_pdf_bytes"]
@@ -473,6 +619,14 @@ elif st.session_state["authentication_status"] is False:
 elif st.session_state["authentication_status"] is None:
 
     st.warning('Please enter your username and password')
+
+    # ── Sign Up link ──────────────────────────────────────────────────────────
+    col_l, col_r = st.columns([3, 1])
+    with col_r:
+        if st.button("📝 Create Account", use_container_width=True, type="secondary"):
+            st.session_state.page = "signup"
+            st.rerun()
+
     st.divider()
 
     st.subheader("💬 Guest Chat (limited memory)")
@@ -485,7 +639,16 @@ elif st.session_state["authentication_status"] is None:
 
     # Guest session init 
     if "guest_thread_id" not in st.session_state:
-        st.session_state.guest_thread_id = f"guest_{uuid.uuid4().hex[:8]}"
+        new_guest_id = f"guest_{uuid.uuid4().hex[:8]}"
+        st.session_state.guest_thread_id = new_guest_id
+        # Clear any previously-indexed guest documents from the engine so
+        # this visitor starts with a clean slate (no cross-session data leakage).
+        engine.clear_guest_data(new_guest_id)  # no-op for brand-new ids
+        engine._chunks        = []             # ensure in-memory cache is empty
+        engine._docs_embed    = __import__("numpy").empty((0,))
+        engine._bm25_index    = None
+        engine._metadata      = []
+        engine._uploaded_docs = []
     if "guest_messages" not in st.session_state:
         st.session_state.guest_messages = []
 
@@ -539,6 +702,52 @@ elif st.session_state["authentication_status"] is None:
         if n_guest_msgs > 0:
             st.caption(f"💬 {n_guest_msgs} message{'s' if n_guest_msgs != 1 else ''} in guest session")
             st.caption("These will transfer to your account on login.")
+        st.divider()
+
+        # Guest PDF upload — chunks are tagged with guest_thread_id and
+        # automatically purged when this session ends or the user logs in.
+        st.subheader("Upload PDF (Guest)")
+        guest_pdf = st.file_uploader("Upload PDF", type="pdf", key="guest_pdf_uploader")
+        if guest_pdf is not None:
+            st.session_state["_guest_pending_pdf_name"]  = guest_pdf.name
+            st.session_state["_guest_pending_pdf_bytes"] = guest_pdf.getvalue()
+
+        g_pending_name  = st.session_state.get("_guest_pending_pdf_name")
+        g_pending_bytes = st.session_state.get("_guest_pending_pdf_bytes")
+        if g_pending_name and g_pending_bytes:
+            if st.button(f"Index  ›  {g_pending_name}", use_container_width=True, key="guest_index_btn"):
+                with st.spinner("Processing…"):
+                    temp_path = f"temp_guest_{g_pending_name}"
+                    with open(temp_path, "wb") as f:
+                        f.write(g_pending_bytes)
+                    engine.process_pdf(
+                        temp_path,
+                        doc_name=g_pending_name,
+                        session_id=st.session_state.guest_thread_id,  # guest-scoped
+                    )
+                    os.remove(temp_path)
+                    del st.session_state["_guest_pending_pdf_name"]
+                    del st.session_state["_guest_pending_pdf_bytes"]
+                    st.success(f"✅ '{g_pending_name}' indexed!")
+                    st.rerun()
+        else:
+            st.button("Index Document", disabled=True, use_container_width=True, key="guest_index_disabled")
+
+        st.divider()
+
+        # End Session: purge guest chunks from ChromaDB and reset state
+        if st.button("🗑 End Guest Session", use_container_width=True, type="secondary"):
+            removed = engine.clear_guest_data(st.session_state.guest_thread_id)
+            delete_guest_session(st.session_state.guest_thread_id)
+            for key in ("guest_thread_id", "guest_messages",
+                        "_guest_pending_pdf_name", "_guest_pending_pdf_bytes"):
+                st.session_state.pop(key, None)
+            if removed:
+                st.success(f"Session ended — {removed} indexed chunk(s) removed.")
+            else:
+                st.success("Session ended.")
+            st.rerun()
+
         st.divider()
         st.caption(f"Session: `{st.session_state.guest_thread_id}`")
         st.caption("Log in for full memory capabilities.")

@@ -469,6 +469,52 @@ class MemoryManager:
         self._conv_counts:   Dict[str, int]   = {}
         self._msg_counts:    Dict[str, int]   = {}
 
+        # Track which user_ids have been fully bootstrapped this runtime.
+        # A new user who has never logged in before gets empty stores on first
+        # access (lazy-init already handles that), but we also explicitly record
+        # them here so diagnostics and cross-user access checks can reason
+        # about "known users vs unknown intruders".
+        self._registered_users: set = set()
+
+    # ── User bootstrap ────────────────────────────────────────────────────────
+
+    def ensure_user_initialized(self, user_id: str) -> None:
+        """
+        Idempotently bootstrap all per-user memory stores for *user_id*.
+
+        Safe to call on every login — repeated calls are no-ops once the
+        user is in _registered_users.  Creates isolated, empty stores the
+        first time a new user is seen; never touches any other user's data.
+        """
+        if not user_id or user_id.startswith("guest_"):
+            return  # guests use _guest_sessions, not per-user stores
+        if user_id in self._registered_users:
+            return  # already set up
+
+        # Touch each store to create empty defaults (lazy-init pattern)
+        _ = self._umem(user_id)
+        _ = self._rconv(user_id)
+        _ = self._get_kg(user_id)
+        _ = self._smeta(user_id)
+        _ = self._csess(user_id)
+
+        self._registered_users.add(user_id)
+        print(f"[MemoryManager] New user bootstrapped: {user_id!r} — "
+              f"isolated memory stores created.")
+
+    def _assert_user_owns_session(self, user_id: str, context: str = "") -> None:
+        """
+        Raise RuntimeError if user_id is not a registered, non-guest user.
+
+        Used as a runtime guard inside methods that must never be called
+        for guests or with an unknown/tampered user_id.
+        """
+        if not user_id or user_id.startswith("guest_"):
+            raise RuntimeError(
+                f"[MemoryManager{' ' + context if context else ''}] "
+                f"Illegal user_id {user_id!r} — guests must not access per-user memory."
+            )
+
     # ── Lazy init ─────────────────────────────────────────────────────────────
 
     def _umem(self, uid: str)  -> UserMemory:
@@ -520,6 +566,9 @@ class MemoryManager:
             return self._gsess(thread_id).get_messages(), ""
 
         assert user_id is not None
+        # Ensure this user has isolated stores — safe no-op for returning users
+        self.ensure_user_initialized(user_id)
+        self._assert_user_owns_session(user_id, "build_context")
         prefix_parts: List[str] = []
 
         # ── Layer 1 – Session Metadata ────────────────────────────────────────
@@ -559,9 +608,13 @@ class MemoryManager:
 
         # ── Layer 7 – Vector Store Retriever (semantic past exchanges) ───────
         if self._vector_store:
-            vector_block = self._vector_store.retrieve(user_id, query)
-            if vector_block:
-                prefix_parts.append(vector_block)
+            try:
+                vector_block = self._vector_store.retrieve(user_id, query)
+                if vector_block:
+                    prefix_parts.append(vector_block)
+            except ValueError as exc:
+                # _validate_user_id raised — should never happen here but log it
+                print(f"[MemoryManager.build_context] Vector store access denied: {exc}")
 
         # ── Layer 8 – Current Session Messages (Buffer Window) ───────────────
         # Returned as BaseMessage list, not part of system prefix
@@ -585,6 +638,9 @@ class MemoryManager:
             return
 
         assert user_id is not None
+        # Ensure isolated stores exist for this user; guard against spoofed ids
+        self.ensure_user_initialized(user_id)
+        self._assert_user_owns_session(user_id, "record_exchange")
 
         # ── Buffer Window – add to current session ───────────────────────────
         self._csess(user_id).add(human, assistant)
@@ -609,17 +665,28 @@ class MemoryManager:
 
     # ── Public: explicit remember / forget (user-driven) ─────────────────────
 
+    def is_new_user(self, user_id: str) -> bool:
+        """Return True if this user_id has never been bootstrapped before."""
+        return user_id not in self._registered_users
+
     def remember(self, text: str, user_id: str) -> str:
-        """Explicitly store a fact. Returns the fact_id."""
+        """Explicitly store a fact for *this* user only. Returns the fact_id."""
+        self.ensure_user_initialized(user_id)
+        self._assert_user_owns_session(user_id, "remember")
         fact = self._umem(user_id).remember(text, source="explicit")
         return fact.fact_id
 
     def forget(self, text_or_id: str, user_id: str) -> bool:
-        """Forget a fact by id or partial text match."""
+        """Forget a fact by id or partial text match for *this* user only."""
+        self.ensure_user_initialized(user_id)
+        self._assert_user_owns_session(user_id, "forget")
         um = self._umem(user_id)
         return um.forget(text_or_id) or um.forget_by_text(text_or_id)
 
     def list_memories(self, user_id: str) -> List[Dict[str, str]]:
+        """List memories belonging to *this* user only."""
+        self.ensure_user_initialized(user_id)
+        self._assert_user_owns_session(user_id, "list_memories")
         return [
             {"id": f.fact_id, "text": f.text, "source": f.source}
             for f in self._umem(user_id).all_facts()
@@ -645,6 +712,8 @@ class MemoryManager:
         (e.g. LLM rate limit) doesn't block the others.
         """
         sess  = self._csess(user_id)
+        # Ensure isolated stores exist — guards against logic errors after logout/login cycles
+        self.ensure_user_initialized(user_id)
         pairs = sess.clear()                          # clears Buffer Window
 
         summary = None
@@ -679,7 +748,9 @@ class MemoryManager:
                         thread_id=thread_id,
                         pairs=pairs,
                     )
-                    print(f"[MemoryManager] Stored {stored} exchanges in Vector Store for {user_id}")
+                    print(f"[MemoryManager] Stored {stored} exchanges in Vector Store for {user_id!r}")
+                except ValueError as exc:
+                    print(f"[MemoryManager.close_and_summarise] Vector store rejected user: {exc}")
                 except Exception as exc:
                     print(f"[MemoryManager.close_and_summarise] Layer 7 (vector store) failed: {exc}")
 

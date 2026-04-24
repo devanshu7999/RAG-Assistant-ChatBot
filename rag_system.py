@@ -140,6 +140,10 @@ class RAGEngine:
         self.llm = ChatGroq(api_key=api_key, model_name=GROQ_MODEL, temperature=0.3)
 
         # ── ChromaDB ──────────────────────────────────────────────────────────
+        # Ensure the storage directory exists before ChromaDB tries to open it.
+        # Without this, PersistentClient raises "Could not connect to tenant
+        # default_tenant" on a fresh checkout where data/chroma doesn't exist yet.
+        os.makedirs(CHROMA_PATH, exist_ok=True)
         self.chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
 
         # in-memory cache
@@ -200,8 +204,23 @@ class RAGEngine:
 
     # ── PDF ingestion ─────────────────────────────────────────────────────────
 
-    def process_pdf(self, pdf_path: str, doc_name: str = "") -> None:
-        """Index a PDF.  *doc_name* is the user-facing filename."""
+    def process_pdf(
+        self,
+        pdf_path:   str,
+        doc_name:   str = "",
+        session_id: str = "global",
+    ) -> None:
+        """
+        Index a PDF.  *doc_name* is the user-facing filename.
+
+        Parameters
+        ----------
+        session_id : The owner of these chunks.
+                     Use the authenticated ``user_id`` for logged-in users,
+                     or the ``guest_thread_id`` (e.g. ``"guest_abc123"``) for
+                     guests.  Every chunk is tagged with this value so it can
+                     be retrieved and purged in isolation.
+        """
         loader   = PyPDFLoader(pdf_path)
         pages    = loader.load()
         splitter = RecursiveCharacterTextSplitter(
@@ -217,10 +236,11 @@ class RAGEngine:
 
         collection = self.chroma_client.get_or_create_collection(COLLECTION_NAME)
         for idx, chunk in enumerate(chunks):
-            # Enrich metadata with document identity
+            # Enrich metadata with document identity AND session ownership
             meta = dict(chunk.metadata)
             meta["doc_name"]     = doc_name
             meta["upload_order"] = upload_order
+            meta["session_id"]   = session_id   # ← ownership tag
             collection.add(
                 documents=[chunk.page_content],
                 metadatas=[meta],
@@ -229,10 +249,21 @@ class RAGEngine:
 
         self._chunks.extend([c.page_content for c in chunks])
         self._metadata.extend(
-            [{**c.metadata, "doc_name": doc_name, "upload_order": upload_order} for c in chunks]
+            [
+                {
+                    **c.metadata,
+                    "doc_name":     doc_name,
+                    "upload_order": upload_order,
+                    "session_id":   session_id,
+                }
+                for c in chunks
+            ]
         )
         self._rebuild_hybrid_indices()
-        print(f"[RAGEngine] Indexed '{doc_name}' (upload #{upload_order}) — {len(chunks)} chunks")
+        print(
+            f"[RAGEngine] Indexed '{doc_name}' (upload #{upload_order}, "
+            f"session={session_id!r}) — {len(chunks)} chunks"
+        )
 
     # ── Collection management ─────────────────────────────────────────────────
 
@@ -249,26 +280,86 @@ class RAGEngine:
             print(f"Error clearing data: {exc}")
             return False
 
-    # ── Internal helpers ──────────────────────────────────────────────────────
-
-    def _load_existing_collection(self) -> None:
-        """Reload documents from the ChromaDB collection into in-memory cache.
-
-        ChromaDB persists data to disk, but the hybrid search indices
-        (dense embeddings + BM25) live in memory.  This method bridges
-        the gap so that previously-indexed PDFs are available immediately
-        after an engine restart.
+    def clear_guest_data(self, session_id: str) -> int:
         """
+        Purge all ChromaDB chunks that belong to a specific guest session,
+        then rebuild the in-memory hybrid indices without those chunks.
+
+        Called on guest logout / new guest session so a subsequent visitor
+        never inherits a previous guest's indexed documents.
+
+        Returns the number of chunks removed.
+        """
+        if not session_id:
+            return 0
+        try:
+            collection = self.chroma_client.get_or_create_collection(COLLECTION_NAME)
+            # ChromaDB where-filter: fetch IDs for chunks owned by this session
+            result = collection.get(
+                where={"session_id": {"$eq": session_id}},
+                include=[],   # IDs only — no text needed
+            )
+            ids_to_delete = result.get("ids", [])
+            if ids_to_delete:
+                collection.delete(ids=ids_to_delete)
+                print(
+                    f"[RAGEngine] Purged {len(ids_to_delete)} guest chunks "
+                    f"for session {session_id!r}"
+                )
+        except Exception as exc:
+            print(f"[RAGEngine.clear_guest_data] ChromaDB delete failed: {exc}")
+            ids_to_delete = []
+
+        # Rebuild in-memory state by dropping guest chunks from the local lists
+        if ids_to_delete:
+            # _metadata mirrors ChromaDB; filter out guest rows by session_id
+            surviving_pairs = [
+                (chunk, meta)
+                for chunk, meta in zip(self._chunks, self._metadata)
+                if meta.get("session_id") != session_id
+            ]
+            if surviving_pairs:
+                self._chunks, self._metadata = map(list, zip(*surviving_pairs))
+            else:
+                self._chunks, self._metadata = [], []
+
+            # Rebuild _uploaded_docs from surviving metadata
+            seen: Dict[str, int] = {}
+            for m in self._metadata:
+                name  = m.get("doc_name", "unknown")
+                order = m.get("upload_order", 0)
+                if name not in seen or order > seen[name]:
+                    seen[name] = order
+            self._uploaded_docs = sorted(seen.items(), key=lambda x: x[1])
+
+            self._rebuild_hybrid_indices()
+
+        return len(ids_to_delete)
+
+    def load_session_data(self, session_id: str) -> None:
+        """
+        Reload only the chunks that belong to *session_id* from ChromaDB
+        into the in-memory hybrid indices.
+
+        Call this after login (pass the user_id) so the engine serves
+        documents the user previously indexed — without exposing any other
+        user's or guest's chunks.
+        """
+        self._chunks        = []
+        self._docs_embed    = np.empty((0,))
+        self._bm25_index    = None
+        self._metadata      = []
+        self._uploaded_docs = []
+
         try:
             collection = self.chroma_client.get_or_create_collection(COLLECTION_NAME)
             count = collection.count()
             if count == 0:
                 return
 
-            # Fetch all documents and metadata from ChromaDB
             result = collection.get(
+                where={"session_id": {"$eq": session_id}},
                 include=["documents", "metadatas"],
-                limit=count,
             )
 
             docs      = result.get("documents", []) or []
@@ -281,7 +372,7 @@ class RAGEngine:
             self._metadata = list(metadatas)
 
             # Reconstruct _uploaded_docs from metadata
-            seen: Dict[str, int] = {}   # doc_name → upload_order
+            seen: Dict[str, int] = {}
             for m in metadatas:
                 name  = m.get("doc_name", "unknown")
                 order = m.get("upload_order", 0)
@@ -291,13 +382,73 @@ class RAGEngine:
 
             self._rebuild_hybrid_indices()
             print(
-                f"[RAGEngine] Reloaded {len(self._chunks)} chunks from ChromaDB "
-                f"({len(self._uploaded_docs)} document(s): "
-                f"{', '.join(n for n, _ in self._uploaded_docs)})"
+                f"[RAGEngine] Loaded {len(self._chunks)} chunks for "
+                f"session={session_id!r} "
+                f"({len(self._uploaded_docs)} document(s))"
             )
 
         except Exception as exc:
-            print(f"[RAGEngine] Could not reload existing collection: {exc}")
+            print(f"[RAGEngine.load_session_data] {exc}")
+
+    # ── Internal helpers ──────────────────────────────────────────────────────
+
+    def _load_existing_collection(self) -> None:
+        """
+        Reload documents from ChromaDB into the in-memory cache.
+
+        Only called at engine startup.  Because chunks are now tagged with
+        ``session_id``, this method loads ALL persisted chunks so that logged-in
+        users can subsequently call ``load_session_data(user_id)`` to filter
+        to their own.  Guest sessions start with an EMPTY cache — ``process_pdf``
+        will populate their view, and ``clear_guest_data`` will wipe it on logout.
+
+        Legacy chunks that pre-date the ``session_id`` field are tagged with
+        ``"global"`` so they remain accessible until explicitly cleared.
+        """
+        try:
+            collection = self.chroma_client.get_or_create_collection(COLLECTION_NAME)
+            count = collection.count()
+            if count == 0:
+                return
+
+            result = collection.get(
+                include=["documents", "metadatas"],
+                limit=count,
+            )
+
+            docs      = result.get("documents", []) or []
+            metadatas = result.get("metadatas", []) or []
+
+            if not docs:
+                return
+
+            # Back-fill session_id = "global" for any legacy chunks that lack it
+            updated_ids   = []
+            updated_metas = []
+            all_ids       = result.get("ids", [])
+            for i, (doc_id, meta) in enumerate(zip(all_ids, metadatas)):
+                if "session_id" not in meta:
+                    meta["session_id"] = "global"
+                    updated_ids.append(doc_id)
+                    updated_metas.append(meta)
+
+            if updated_ids:
+                collection.update(ids=updated_ids, metadatas=updated_metas)
+                print(
+                    f"[RAGEngine] Back-filled session_id='global' on "
+                    f"{len(updated_ids)} legacy chunks"
+                )
+
+            # Do NOT load any chunks into the active session at engine startup.
+            # Authenticated users call load_session_data(user_id) after login.
+            # Guests start empty — they only see what they upload this session.
+            print(
+                f"[RAGEngine] ChromaDB has {count} persisted chunk(s). "
+                "Call load_session_data(session_id) to activate a session's documents."
+            )
+
+        except Exception as exc:
+            print(f"[RAGEngine] Could not inspect existing collection: {exc}")
 
     def _rebuild_hybrid_indices(self) -> None:
         if not self._chunks:
