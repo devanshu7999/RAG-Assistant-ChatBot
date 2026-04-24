@@ -12,7 +12,10 @@ venv/
 # .venv/
 
 
-# *.yaml
+*.yaml
+
+
+config.py
 
 
 # Data folder (local embeddings / uploads)
