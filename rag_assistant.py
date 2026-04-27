@@ -1,7 +1,7 @@
 # Streamlit UI and session management
 # Features:
 #   - Persistent per-user chat history (survives logout/restart)
-#   - Signup page: new users register and are written to Postgres + auth.yaml
+#   - Signup page: new users register and are written to Postgres 
 #   - Guest Chat → Personal Account transfer on login
 #   - Sidebar with named past chats
 #   - Rename past chats inline
