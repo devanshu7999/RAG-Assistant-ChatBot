@@ -50,16 +50,9 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage, AIMessage, BaseMessage
 
-try:
-    from memori import Memori
-    _MEMORI_AVAILABLE = True
-except ImportError:
-    _MEMORI_AVAILABLE = False
-
 from config import (
     GROQ_API_KEY, GROQ_MODEL,
     BUFFER_WINDOW_SIZE, SUMMARY_THRESHOLD,
-    MEMORI_API_KEY,
 )
 from global_memory import GlobalSummaryMemory, UserAccountKnowledgeGraph
 

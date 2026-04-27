@@ -22,15 +22,11 @@ chromadb==1.4.0
 # PDF loading
 pypdf==6.5.0
 
-# Long-term memory
-memori
-
 # LLM provider
 groq==0.23.1
 
 # Utilities
 numpy>=1.26.0
-pyyaml>=6.0
 
 # Knowledge Graph persistence
 neo4j>=5.0.0

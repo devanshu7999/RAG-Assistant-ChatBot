@@ -13,8 +13,6 @@
 import streamlit as st
 import os
 import uuid
-import yaml
-from yaml.loader import SafeLoader
 import streamlit_authenticator as stauth
 from rag_system import RAGEngine
 from chat_store import (
@@ -36,35 +34,25 @@ def _next_chat_name() -> str:
     return f"Chat {n}"
 
 
-# ── DB + auth.yaml bootstrap ─────────────────────────────────────────────────
+# ── DB bootstrap ──────────────────────────────────────────────────────────────
 # Ensure PostgreSQL schema exists on first run.
 user_db.init_db()
 
 
 def _build_auth_config() -> dict:
     """
-    Build the streamlit-authenticator config dict by merging auth.yaml
-    (static/seeded users) with live users from Postgres.
-
-    The Postgres DB is the source of truth for dynamically-registered users.
-    auth.yaml is used only for pre-seeded / admin accounts.
+    Build the streamlit-authenticator config dict from Postgres.
+    PostgreSQL is the single source of truth for all user accounts.
     """
-    # Load base yaml (pre-seeded users like batman/hanuman)
-    try:
-        with open("auth.yaml") as f:
-            config = yaml.load(f, Loader=SafeLoader)
-    except FileNotFoundError:
-        config = {
-            "credentials": {"usernames": {}},
-            "cookie": {
-                "expiry_days": 30,
-                "key": "rag_app_secret_key",
-                "name": "rag_cookie",
-            },
-            "preauthorized": {"emails": []},
-        }
+    config = {
+        "credentials": {"usernames": {}},
+        "cookie": {
+            "expiry_days": 30,
+            "key": "rag_app_secret_key",
+            "name": "rag_cookie",
+        },
+    }
 
-    # Merge Postgres users into credentials (Postgres wins on conflict)
     db_users = user_db.get_all_users_for_auth_yaml()
     for u in db_users:
         config["credentials"]["usernames"][u["user_id"]] = {

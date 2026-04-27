@@ -12,9 +12,6 @@ venv/
 # .venv/
 
 
-auth.yaml
-
-
 config.py
 
 
