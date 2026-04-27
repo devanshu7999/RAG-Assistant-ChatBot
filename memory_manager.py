@@ -30,10 +30,13 @@ Context injection order (into every prompt):
   5. Global Summary Memory   - condensed knowledge from all users (shared)
   6. Account Knowledge Graph - domain entity triples              (per-user)
   7. Vector Store Retriever  - semantically similar past exchanges(per-user)
-  8. Current Session Messages- full raw transcript of THIS chat   (in-context)
+  8. PostgreSQL Doc Fallback - full-document chunk search         (per-user,
+                               only triggered when Layer 7 is empty/low-conf)
+  9. Current Session Messages- full raw transcript of THIS chat   (in-context)
 
 Retrieval fallback order:
   Buffer Window → Global Memory + User Memory → Vector Store Retriever
+    → PostgreSQL Document Chunks (persistent full-document storage, per-user)
 """
 
 from __future__ import annotations
@@ -62,6 +65,7 @@ try:
 except ImportError:
     _NEO4J_KG_AVAILABLE = False
 from vector_memory import VectorMemoryStore
+from pg_doc_retriever import PgDocRetriever
 
 # How many past-conversation summaries to inject 
 RECENT_CONV_LIMIT = 15
@@ -434,9 +438,11 @@ class MemoryManager:
         llm:            ChatGroq,
         vector_store:   Optional[VectorMemoryStore] = None,
         neo4j_driver    = None,
+        st_model        = None,   # SentenceTransformer — required for PG doc fallback
     ):
         self.llm = llm
         self._neo4j_driver = neo4j_driver
+        self._st_model = st_model   # used by PgDocRetriever for embedding-based re-ranking
 
         # ── GLOBAL MEMORY ──────────────────────────────────────────────────────
         self._global_summary = GlobalSummaryMemory()
@@ -613,6 +619,7 @@ class MemoryManager:
             prefix_parts.append(global_kg_block)
 
         # ── Layer 7 – Vector Store Retriever (semantic past exchanges) ───────
+        vector_block = ""
         if self._vector_store:
             try:
                 vector_block = self._vector_store.retrieve(user_id, query)
@@ -621,6 +628,30 @@ class MemoryManager:
             except ValueError as exc:
                 # _validate_user_id raised — should never happen here but log it
                 print(f"[MemoryManager.build_context] Vector store access denied: {exc}")
+
+        # ── Layer 8 – PostgreSQL Document Fallback ────────────────────────────
+        # Only triggered when the Vector Store (Layer 7) returned nothing —
+        # meaning no relevant past-conversation exchanges were found.
+        # In that case we fall back to the user's full uploaded documents
+        # stored persistently in PostgreSQL (user_document_chunks table).
+        # This ensures the assistant can ALWAYS answer document questions,
+        # even when a query is about a document from a much older session
+        # that was never captured as a conversation exchange in the vector store.
+        if not vector_block and self._st_model:
+            try:
+                pg_block = PgDocRetriever.retrieve(
+                    user_id  = user_id,
+                    query    = query,
+                    st_model = self._st_model,
+                )
+                if pg_block:
+                    prefix_parts.append(pg_block)
+                    print(
+                        f"[MemoryManager] Layer 8 (PG doc fallback) injected "
+                        f"for user={user_id!r} — vector store was empty."
+                    )
+            except Exception as exc:
+                print(f"[MemoryManager.build_context] PG doc fallback failed: {exc}")
 
         # ── Layer 8 – Current Session Messages (Buffer Window) ───────────────
         # Returned as BaseMessage list, not part of system prefix

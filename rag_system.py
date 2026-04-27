@@ -196,6 +196,7 @@ class RAGEngine:
             llm=self.llm,
             vector_store=self.vector_store,
             neo4j_driver=self._neo4j_driver,
+            st_model=self.st_model,   # shared model — PgDocRetriever uses this for re-ranking
         )
 
         # ── Build the LangGraph workflow ──────────────────────────────────────
@@ -727,11 +728,33 @@ class RAGEngine:
                     + "or ask the user to rephrase."
                 )
             else:
-                # No documents indexed — answer from memory + persona
-                system_msg = (
-                    (memory_prefix + "\n\n" if memory_prefix else "")
-                    + _BUTLER_BASE
+                # No documents in the active ChromaDB session.
+                # The memory_prefix may still contain document knowledge
+                # injected by the PG doc fallback layer (Layer 8).  When it
+                # does, we MUST tell the LLM it has that context — otherwise
+                # the LLM incorrectly tells the user it only has conversation
+                # knowledge (the bug shown in the screenshot).
+                has_pg_doc_context = (
+                    memory_prefix
+                    and "[Document Knowledge (persistent storage)]" in memory_prefix
                 )
+                if has_pg_doc_context:
+                    system_msg = (
+                        (memory_prefix + "\n\n" if memory_prefix else "")
+                        + _BUTLER_BASE + "\n\n"
+                        + "IMPORTANT: The [Document Knowledge (persistent storage)] "
+                        + "block above contains full document content from the user's "
+                        + "previously uploaded files (retrieved from persistent storage). "
+                        + "Use it to answer questions about those documents. "
+                        + "Do NOT claim you only have conversation knowledge — you have "
+                        + "the actual document content available above."
+                    )
+                else:
+                    # Genuinely no document context — answer from memory + persona only
+                    system_msg = (
+                        (memory_prefix + "\n\n" if memory_prefix else "")
+                        + _BUTLER_BASE
+                    )
 
             # ── Trim old messages to prevent stale doc history ────────────────
             # The LangGraph checkpointer replays ALL previous messages in the

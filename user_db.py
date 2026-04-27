@@ -1,5 +1,5 @@
 """
-user_db.py  –  PostgreSQL-backed user account management
+user_db.py  -  PostgreSQL-backed user account management
 =========================================================
 
 Handles signup, login verification, and per-user record tracking.
