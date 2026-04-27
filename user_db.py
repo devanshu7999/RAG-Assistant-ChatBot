@@ -36,6 +36,18 @@ Schema
   created_at  TIMESTAMPTZ DEFAULT now()
   UNIQUE(user_id, thread_id)
 
+  user_document_chunks
+  ────────────────────
+  id            SERIAL PRIMARY KEY
+  user_id       TEXT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE
+  doc_name      TEXT NOT NULL
+  chunk_index   INT  NOT NULL
+  chunk_text    TEXT NOT NULL
+  page_number   INT
+  upload_order  INT  NOT NULL DEFAULT 1
+  created_at    TIMESTAMPTZ DEFAULT now()
+  UNIQUE(user_id, doc_name, chunk_index)
+
 Isolation guarantee
 -------------------
 Every SELECT/INSERT/UPDATE/DELETE in this module is parameterised with
@@ -99,8 +111,21 @@ CREATE TABLE IF NOT EXISTS user_conversations (
     UNIQUE (user_id, thread_id)
 );
 
+CREATE TABLE IF NOT EXISTS user_document_chunks (
+    id            SERIAL PRIMARY KEY,
+    user_id       TEXT        NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    doc_name      TEXT        NOT NULL,
+    chunk_index   INT         NOT NULL,
+    chunk_text    TEXT        NOT NULL,
+    page_number   INT,
+    upload_order  INT         NOT NULL DEFAULT 1,
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (user_id, doc_name, chunk_index)
+);
+
 CREATE INDEX IF NOT EXISTS idx_umf_user_id ON user_memory_facts (user_id);
 CREATE INDEX IF NOT EXISTS idx_uc_user_id  ON user_conversations (user_id);
+CREATE INDEX IF NOT EXISTS idx_udc_user_id ON user_document_chunks (user_id);
 """
 
 
@@ -348,4 +373,135 @@ def load_conversations(user_id: str) -> List[Dict[str, Any]]:
         return [dict(r) for r in rows]
     except Exception as exc:
         print(f"[user_db.load_conversations] user={user_id!r}: {exc}")
+        return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Per-user document chunks  (PostgreSQL = source of truth for PDF persistence)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def save_document_chunks(
+    user_id:      str,
+    doc_name:     str,
+    chunks:       List[Dict[str, Any]],
+    upload_order: int = 1,
+) -> None:
+    """
+    Batch-insert PDF chunks for *this user only*.
+
+    Each element in `chunks` is a dict with keys:
+        - text:        str   (the chunk content)
+        - page_number: int | None
+        - chunk_index: int   (sequential position within the document)
+
+    Uses ON CONFLICT to handle re-uploads of the same document gracefully.
+    """
+    if not chunks:
+        return
+    try:
+        with _connect() as conn:
+            for ch in chunks:
+                conn.execute(
+                    """
+                    INSERT INTO user_document_chunks
+                        (user_id, doc_name, chunk_index, chunk_text, page_number, upload_order)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id, doc_name, chunk_index) DO UPDATE
+                        SET chunk_text    = EXCLUDED.chunk_text,
+                            page_number   = EXCLUDED.page_number,
+                            upload_order  = EXCLUDED.upload_order
+                    """,
+                    (
+                        user_id,
+                        doc_name,
+                        ch["chunk_index"],
+                        ch["text"],
+                        ch.get("page_number"),
+                        upload_order,
+                    ),
+                )
+            conn.commit()
+        print(f"[user_db] Saved {len(chunks)} chunks for user={user_id!r}, doc={doc_name!r}")
+    except Exception as exc:
+        print(f"[user_db.save_document_chunks] user={user_id!r}: {exc}")
+
+
+def load_document_chunks(user_id: str) -> List[Dict[str, Any]]:
+    """
+    Load ALL document chunks belonging to *this user only*.
+
+    Returns a list of dicts:
+        [{"doc_name": str, "chunk_index": int, "chunk_text": str,
+          "page_number": int|None, "upload_order": int}, ...]
+
+    The WHERE user_id = %s clause guarantees strict isolation.
+    """
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT doc_name, chunk_index, chunk_text, page_number, upload_order
+                FROM user_document_chunks
+                WHERE user_id = %s
+                ORDER BY upload_order, chunk_index
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        print(f"[user_db.load_document_chunks] user={user_id!r}: {exc}")
+        return []
+
+
+def delete_document_chunks(user_id: str, doc_name: Optional[str] = None) -> int:
+    """
+    Delete chunks for *this user only*.
+
+    If doc_name is provided, delete only that document's chunks.
+    If doc_name is None, delete ALL chunks for the user.
+
+    Returns the number of rows deleted.
+    """
+    try:
+        with _connect() as conn:
+            if doc_name:
+                result = conn.execute(
+                    "DELETE FROM user_document_chunks WHERE user_id = %s AND doc_name = %s",
+                    (user_id, doc_name),
+                )
+            else:
+                result = conn.execute(
+                    "DELETE FROM user_document_chunks WHERE user_id = %s",
+                    (user_id,),
+                )
+            conn.commit()
+        deleted = result.rowcount or 0
+        print(f"[user_db] Deleted {deleted} chunks for user={user_id!r}, doc={doc_name!r}")
+        return deleted
+    except Exception as exc:
+        print(f"[user_db.delete_document_chunks] user={user_id!r}: {exc}")
+        return 0
+
+
+def get_user_doc_names(user_id: str) -> List[Dict[str, Any]]:
+    """
+    Return distinct document names and their upload_order for *this user only*.
+
+    Returns: [{"doc_name": str, "upload_order": int, "chunk_count": int}, ...]
+    """
+    try:
+        with _connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT doc_name, MAX(upload_order) AS upload_order, COUNT(*) AS chunk_count
+                FROM user_document_chunks
+                WHERE user_id = %s
+                GROUP BY doc_name
+                ORDER BY upload_order
+                """,
+                (user_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as exc:
+        print(f"[user_db.get_user_doc_names] user={user_id!r}: {exc}")
         return []

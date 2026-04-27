@@ -84,7 +84,7 @@ def _show_signup_page() -> None:
       • Inserts the new user into Postgres (users table, user_id column).
       • Flips st.session_state.page back to 'login' so the user can sign in.
     """
-    st.title("📝 Create an Account")
+    st.title("Create an Account")
     st.caption("Fill in the details below to register.")
 
     with st.form("signup_form", clear_on_submit=False):
@@ -451,7 +451,7 @@ if st.session_state["authentication_status"]:
         st.markdown(f"-> **Vector Store** — {vs.get('stored_memories', 0)} stored memories")
 
         st.markdown("")
-        st.markdown(" **Global Memory (shared) :**")
+        st.markdown(" **Global + Account Memory :**")
 
         n_global_facts = diag.get("global_summary_facts", 0)
         st.markdown(f"-> **Global Summary** — {n_global_facts} fact{'s' if n_global_facts != 1 else ''}")
@@ -463,10 +463,10 @@ if st.session_state["authentication_status"]:
 
         gkg = diag.get("global_kg_stats", {})
         n_gkg_edges = gkg.get("edges", 0)
-        st.markdown(f"-> **Global KG** — {gkg.get('nodes', 0)} nodes / {n_gkg_edges} edges")
+        st.markdown(f"-> **Account KG** — {gkg.get('nodes', 0)} nodes / {n_gkg_edges} edges")
         if n_gkg_edges > 0:
-            with st.expander("Preview Global KG", expanded=False):
-                gedges = engine.memory_mgr.get_global_kg_edges()
+            with st.expander("Preview Account KG", expanded=False):
+                gedges = engine.memory_mgr.get_global_kg_edges(user_id)
                 for e in gedges[:20]:
                     st.caption(f"**{e['subject']}** —[ {e['relation']} ]→ **{e['object']}**")
                 if len(gedges) > 20:
@@ -519,7 +519,7 @@ if st.session_state["authentication_status"]:
         st.divider()
 
         if st.button("Clear Collection", type="secondary"):
-            if engine.clear_all_data():
+            if engine.clear_all_data(user_id=user_id):
                 st.session_state.messages = []
                 st.success("Collection cleared!")
                 st.rerun()
@@ -623,7 +623,7 @@ elif st.session_state["authentication_status"] is None:
     # ── Sign Up link ──────────────────────────────────────────────────────────
     col_l, col_r = st.columns([3, 1])
     with col_r:
-        if st.button("📝 Create Account", use_container_width=True, type="secondary"):
+        if st.button("Create Account", use_container_width=True, type="secondary"):
             st.session_state.page = "signup"
             st.rerun()
 

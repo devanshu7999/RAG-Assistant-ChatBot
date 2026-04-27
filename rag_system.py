@@ -234,6 +234,28 @@ class RAGEngine:
             doc_name = os.path.basename(pdf_path)
         self._uploaded_docs.append((doc_name, upload_order))
 
+        # ── Persist to PostgreSQL for authenticated users ─────────────────
+        # Guest sessions (session_id starts with "guest_") skip Postgres
+        # because they have no row in the users table (FK would fail).
+        is_guest_session = session_id.startswith("guest_")
+        if not is_guest_session and session_id != "global":
+            pg_chunks = [
+                {
+                    "text":        chunk.page_content,
+                    "page_number": chunk.metadata.get("page"),
+                    "chunk_index": idx,
+                }
+                for idx, chunk in enumerate(chunks)
+            ]
+            import user_db
+            user_db.save_document_chunks(
+                user_id=session_id,
+                doc_name=doc_name,
+                chunks=pg_chunks,
+                upload_order=upload_order,
+            )
+
+        # ── Add to ChromaDB (search index) ────────────────────────────────
         collection = self.chroma_client.get_or_create_collection(COLLECTION_NAME)
         for idx, chunk in enumerate(chunks):
             # Enrich metadata with document identity AND session ownership
@@ -267,7 +289,7 @@ class RAGEngine:
 
     # ── Collection management ─────────────────────────────────────────────────
 
-    def clear_all_data(self) -> bool:
+    def clear_all_data(self, user_id: str | None = None) -> bool:
         try:
             self.chroma_client.delete_collection(COLLECTION_NAME)
             self._chunks        = []
@@ -275,6 +297,10 @@ class RAGEngine:
             self._bm25_index    = None
             self._metadata      = []
             self._uploaded_docs  = []
+            # Also clear this user's chunks from PostgreSQL
+            if user_id:
+                import user_db
+                user_db.delete_document_chunks(user_id)
             return True
         except Exception as exc:
             print(f"Error clearing data: {exc}")
@@ -338,12 +364,15 @@ class RAGEngine:
 
     def load_session_data(self, session_id: str) -> None:
         """
-        Reload only the chunks that belong to *session_id* from ChromaDB
-        into the in-memory hybrid indices.
+        Reload the chunks that belong to *session_id* from **PostgreSQL**
+        (the permanent store) into ChromaDB + in-memory hybrid indices.
 
-        Call this after login (pass the user_id) so the engine serves
-        documents the user previously indexed — without exposing any other
-        user's or guest's chunks.
+        PostgreSQL is the source of truth — this guarantees that a user's
+        chunks survive ChromaDB resets, server restarts, and data/chroma
+        directory wipes.
+
+        Guest sessions (session_id starting with "guest_") fall back to
+        the old ChromaDB-only path since they have no Postgres rows.
         """
         self._chunks        = []
         self._docs_embed    = np.empty((0,))
@@ -351,6 +380,72 @@ class RAGEngine:
         self._metadata      = []
         self._uploaded_docs = []
 
+        is_guest = session_id.startswith("guest_")
+
+        if not is_guest:
+            # ── Load from PostgreSQL (source of truth) ────────────────────
+            import user_db
+            pg_rows = user_db.load_document_chunks(session_id)
+
+            if not pg_rows:
+                print(f"[RAGEngine] No chunks in PostgreSQL for session={session_id!r}")
+                return
+
+            # Populate in-memory caches
+            self._chunks   = [r["chunk_text"] for r in pg_rows]
+            self._metadata = [
+                {
+                    "doc_name":     r["doc_name"],
+                    "page":         r["page_number"],
+                    "upload_order": r["upload_order"],
+                    "session_id":   session_id,
+                }
+                for r in pg_rows
+            ]
+
+            # Reconstruct _uploaded_docs from metadata
+            seen: Dict[str, int] = {}
+            for r in pg_rows:
+                name  = r["doc_name"]
+                order = r["upload_order"]
+                if name not in seen or order > seen[name]:
+                    seen[name] = order
+            self._uploaded_docs = sorted(seen.items(), key=lambda x: x[1])
+
+            # Re-populate ChromaDB so hybrid search works this session
+            try:
+                collection = self.chroma_client.get_or_create_collection(COLLECTION_NAME)
+                # First purge any stale ChromaDB entries for this user
+                try:
+                    existing = collection.get(
+                        where={"session_id": {"$eq": session_id}},
+                        include=[],
+                    )
+                    old_ids = existing.get("ids", [])
+                    if old_ids:
+                        collection.delete(ids=old_ids)
+                except Exception:
+                    pass
+
+                # Add all chunks from Postgres into ChromaDB
+                for idx, (text, meta) in enumerate(zip(self._chunks, self._metadata)):
+                    collection.add(
+                        documents=[text],
+                        metadatas=[meta],
+                        ids=[f"chunk_{idx}"],
+                    )
+            except Exception as exc:
+                print(f"[RAGEngine.load_session_data] ChromaDB repopulate failed: {exc}")
+
+            self._rebuild_hybrid_indices()
+            print(
+                f"[RAGEngine] Loaded {len(self._chunks)} chunks from PostgreSQL for "
+                f"session={session_id!r} "
+                f"({len(self._uploaded_docs)} document(s))"
+            )
+            return
+
+        # ── Guest fallback: load from ChromaDB directly ───────────────────
         try:
             collection = self.chroma_client.get_or_create_collection(COLLECTION_NAME)
             count = collection.count()
@@ -382,8 +477,8 @@ class RAGEngine:
 
             self._rebuild_hybrid_indices()
             print(
-                f"[RAGEngine] Loaded {len(self._chunks)} chunks for "
-                f"session={session_id!r} "
+                f"[RAGEngine] Loaded {len(self._chunks)} chunks from ChromaDB for "
+                f"guest session={session_id!r} "
                 f"({len(self._uploaded_docs)} document(s))"
             )
 

@@ -1,13 +1,17 @@
 """
-global_memory.py  –  Shared memory layers across all users and sessions
+global_memory.py  –  Per-user account-level memory layers
 =======================================================================
 
 Two layers:
-  1. GlobalSummaryMemory  – condensed knowledge facts from all interactions
-  2. GlobalKnowledgeGraph – structured entity-relation triples from all users
+  1. GlobalSummaryMemory        – condensed knowledge facts from all interactions
+                                  (shared across all users; general/domain knowledge only)
+  2. UserAccountKnowledgeGraph  – per-user account-level entity-relation triples
+                                  (isolated per user, shared across all their chats;
+                                   no cross-user data leakage)
 
-Both are injected into every prompt for every user (logged-in or guest).
-They represent the system's "world knowledge" accumulated over time.
+GlobalSummaryMemory is injected into every prompt for every user.
+UserAccountKnowledgeGraph is per-user: each user’s KG is private and persists
+across all their conversations.  Guests get no KG access.
 """
 
 from __future__ import annotations
@@ -147,7 +151,7 @@ class GlobalSummaryMemory:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global Knowledge Graph
+# Per-User Account-Level Knowledge Graph (in-memory fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -157,14 +161,16 @@ class GlobalKGEdge:
     target:   str
 
 
-class GlobalKnowledgeGraph:
+class UserAccountKnowledgeGraph:
     """
-    A single shared Knowledge Graph that accumulates entity-relation triples
-    from ALL users' interactions.  Stores structured relationships between
-    entities and concepts at a system-wide level.
+    Per-user account-level Knowledge Graph (in-memory fallback when Neo4j
+    is unavailable).  Each user gets their own isolated instance that
+    persists across all their conversations.  No cross-user data leakage;
+    guests are never given access to this layer.
 
-    Separate from per-user KG: this captures domain/document-level
-    relationships, not personal user facts.
+    Stores structured relationships between domain entities and concepts.
+    Separate from per-conversation KG: this captures account-wide
+    knowledge, not per-exchange personal facts.
     """
 
     _EXTRACT_PROMPT = (
@@ -215,7 +221,7 @@ class GlobalKnowledgeGraph:
         if not hits:
             return ""
         unique = list(dict.fromkeys(hits))[:15]
-        return "[Global Knowledge Graph]\n" + "\n".join(f"• {h}" for h in unique)
+        return "[Account Knowledge Graph]\n" + "\n".join(f"• {h}" for h in unique)
 
     def stats(self) -> Dict[str, int]:
         return {"nodes": len(self.nodes), "edges": len(self.edges)}

@@ -3,7 +3,7 @@ neo4j_kg.py  -  Neo4j-backed Knowledge Graph classes
 =====================================================
 
 Drop-in replacements for the in-memory KnowledgeGraph (per-user)
-and GlobalKnowledgeGraph (shared) that persist triples to Neo4j.
+and GlobalKnowledgeGraph (per-user account-level) that persist triples to Neo4j.
 
 Graph Model
 -----------
@@ -14,11 +14,11 @@ Graph Model
 Visualise everything in Neo4j Browser:
   MATCH (a)-[r:RELATES_TO]->(b) RETURN a, r, b
 
-Filter by user:
-  MATCH (a)-[r:RELATES_TO {user_id: "devanshu"}]->(b) RETURN a, r, b
+Filter by user (conversation-level KG):
+  MATCH (a)-[r:RELATES_TO {user_id: "devanshu", scope: "user"}]->(b) RETURN a, r, b
 
-Filter global only:
-  MATCH (a)-[r:RELATES_TO {scope: "global"}]->(b) RETURN a, r, b
+Filter by user (account-level KG):
+  MATCH (a)-[r:RELATES_TO {user_id: "devanshu", scope: "account"}]->(b) RETURN a, r, b
 """
 
 from __future__ import annotations
@@ -195,12 +195,16 @@ class Neo4jKnowledgeGraph:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Global Neo4j Knowledge Graph
+# Per-User Account-Level Neo4j Knowledge Graph
 # ─────────────────────────────────────────────────────────────────────────────
 
 class Neo4jGlobalKnowledgeGraph:
     """
-    Neo4j-backed global Knowledge Graph (shared across all users).
+    Neo4j-backed per-user account-level Knowledge Graph.
+
+    Each user has their own isolated KG that persists across all their
+    conversations.  Triples are scoped with ``scope='account'`` and
+    filtered by ``user_id`` — no cross-user data leakage.
 
     Same public API as GlobalKnowledgeGraph in global_memory.py:
       add(), query(), extract_and_store(), stats()
@@ -215,13 +219,14 @@ class Neo4jGlobalKnowledgeGraph:
         "TEXT:\n{text}"
     )
 
-    def __init__(self, driver):
+    def __init__(self, driver, user_id: str):
         self._driver = driver
+        self._user_id = user_id
 
     # ── Mutations ─────────────────────────────────────────────────────────────
 
     def add(self, subject: str, relation: str, obj: str) -> None:
-        """MERGE a global triple into Neo4j."""
+        """MERGE an account-level triple into Neo4j for this user."""
         s, o = subject.lower().strip(), obj.lower().strip()
         if not s or not relation.strip() or not o:
             return
@@ -232,16 +237,18 @@ class Neo4jGlobalKnowledgeGraph:
                     MERGE (a:Concept {name: $source})
                     MERGE (b:Concept {name: $target})
                     MERGE (a)-[r:RELATES_TO {relation: $relation,
-                                             scope: 'global'}]->(b)
+                                             user_id: $user_id,
+                                             scope: 'account'}]->(b)
                     """,
                     source=s, target=o, relation=relation.strip(),
+                    user_id=self._user_id,
                 )
         except Exception as exc:
             print(f"[Neo4jGlobalKG.add] {exc}")
 
     def extract_and_store(self, text: str, llm: ChatGroq,
                           max_triples: int = 8) -> None:
-        """Ask the LLM for domain triples and store globally in Neo4j."""
+        """Ask the LLM for domain triples and store in this user's account KG."""
         prompt = self._EXTRACT_PROMPT.format(text=text[:1500])
         try:
             raw = llm.invoke([HumanMessage(content=prompt)]).content
@@ -258,44 +265,46 @@ class Neo4jGlobalKnowledgeGraph:
     # ── Queries ───────────────────────────────────────────────────────────────
 
     def query(self, tokens: List[str]) -> str:
-        """Return matching global triples as a formatted prompt block."""
+        """Return matching account-level triples for this user."""
         if not tokens:
             return ""
         try:
             with self._driver.session() as session:
                 result = session.run(
                     """
-                    MATCH (a:Concept)-[r:RELATES_TO {scope: 'global'}]->(b:Concept)
+                    MATCH (a:Concept)-[r:RELATES_TO {user_id: $user_id, scope: 'account'}]->(b:Concept)
                     WHERE any(tok IN $tokens WHERE a.name CONTAINS tok OR b.name CONTAINS tok)
                     RETURN a.name AS source, r.relation AS relation, b.name AS target
                     LIMIT 15
                     """,
-                    tokens=tokens,
+                    user_id=self._user_id, tokens=tokens,
                 )
                 hits = [f"{rec['source']} {rec['relation']} {rec['target']}"
                         for rec in result]
             if not hits:
                 return ""
-            return "[Global Knowledge Graph]\n" + "\n".join(f"• {h}" for h in hits)
+            return "[Account Knowledge Graph]\n" + "\n".join(f"• {h}" for h in hits)
         except Exception as exc:
             print(f"[Neo4jGlobalKG.query] {exc}")
             return ""
 
     def stats(self) -> Dict[str, int]:
-        """Return global node/edge counts."""
+        """Return node/edge counts for this user's account KG."""
         try:
             with self._driver.session() as session:
                 edge_count = session.run(
-                    "MATCH ()-[r:RELATES_TO {scope: 'global'}]->() "
-                    "RETURN count(r) AS cnt"
+                    "MATCH ()-[r:RELATES_TO {user_id: $user_id, scope: 'account'}]->() "
+                    "RETURN count(r) AS cnt",
+                    user_id=self._user_id,
                 ).single()["cnt"]
                 node_count = session.run(
                     """
-                    MATCH (a)-[r:RELATES_TO {scope: 'global'}]->(b)
+                    MATCH (a)-[r:RELATES_TO {user_id: $user_id, scope: 'account'}]->(b)
                     WITH collect(DISTINCT a) + collect(DISTINCT b) AS nodes
                     UNWIND nodes AS n
                     RETURN count(DISTINCT n) AS cnt
-                    """
+                    """,
+                    user_id=self._user_id,
                 ).single()["cnt"]
             return {"nodes": node_count, "edges": edge_count}
         except Exception as exc:
@@ -304,14 +313,15 @@ class Neo4jGlobalKnowledgeGraph:
 
     @property
     def edges(self) -> list:
-        """Return all global edges."""
+        """Return all edges for this user's account KG."""
         try:
             with self._driver.session() as session:
                 result = session.run(
                     """
-                    MATCH (a:Concept)-[r:RELATES_TO {scope: 'global'}]->(b:Concept)
+                    MATCH (a:Concept)-[r:RELATES_TO {user_id: $user_id, scope: 'account'}]->(b:Concept)
                     RETURN a.name AS source, r.relation AS relation, b.name AS target
-                    """
+                    """,
+                    user_id=self._user_id,
                 )
                 return [_EdgeRecord(rec["source"], rec["relation"], rec["target"])
                         for rec in result]
@@ -321,16 +331,17 @@ class Neo4jGlobalKnowledgeGraph:
 
     @property
     def nodes(self) -> Dict[str, str]:
-        """Return all global nodes."""
+        """Return all nodes for this user's account KG."""
         try:
             with self._driver.session() as session:
                 result = session.run(
                     """
-                    MATCH (a)-[r:RELATES_TO {scope: 'global'}]->(b)
+                    MATCH (a)-[r:RELATES_TO {user_id: $user_id, scope: 'account'}]->(b)
                     WITH collect(DISTINCT a) + collect(DISTINCT b) AS nodes
                     UNWIND nodes AS n
                     RETURN n.name AS name
-                    """
+                    """,
+                    user_id=self._user_id,
                 )
                 return {rec["name"]: "Concept" for rec in result}
         except Exception as exc:

@@ -6,7 +6,9 @@ Memory Layers:
   
     GLOBAL MEMORY (shared across ALL users and sessions)            
       • Global Summary Memory  - condensed knowledge from all chats 
-      • Global Knowledge Graph - structured entity-relation triples 
+  
+    PER-USER ACCOUNT MEMORY (isolated per user, shared across chats)
+      • Account Knowledge Graph - per-user domain entity triples    
   
     PER-CONVERSATION MEMORY                                         
                                                                     
@@ -26,7 +28,7 @@ Context injection order (into every prompt):
   3. Recent Conversations    - ~15 past-chat dated summaries      (pre-computed)
   4. User Knowledge Graph    - user-specific entity triples       (per-user)
   5. Global Summary Memory   - condensed knowledge from all users (shared)
-  6. Global Knowledge Graph  - domain entity triples              (shared)
+  6. Account Knowledge Graph - domain entity triples              (per-user)
   7. Vector Store Retriever  - semantically similar past exchanges(per-user)
   8. Current Session Messages- full raw transcript of THIS chat   (in-context)
 
@@ -59,7 +61,7 @@ from config import (
     BUFFER_WINDOW_SIZE, SUMMARY_THRESHOLD,
     MEMORI_API_KEY,
 )
-from global_memory import GlobalSummaryMemory, GlobalKnowledgeGraph
+from global_memory import GlobalSummaryMemory, UserAccountKnowledgeGraph
 
 try:
     from neo4j_kg import Neo4jKnowledgeGraph, Neo4jGlobalKnowledgeGraph
@@ -415,16 +417,16 @@ class MemoryManager:
     """
     Single entry-point.  Per-user state is keyed by user_id.
     Guest users get only Buffer Window Memory (current session messages).
-    Logged-in users get all layers including Global Memory and Vector Store.
+    Logged-in users get all layers including Account KG and Vector Store.
 
     Memory layer hierarchy:
       ┌─ Global Memory (always available) ───────────────────┐
       │  • Global Summary Memory (shared condensed knowledge)│
-      │  • Global Knowledge Graph (shared entity triples)    │
       ├─ Per-User Memory (logged-in only) ───────────────────┤
       │  • User Memory (persistent facts)                    │
       │  • Recent Conversations (pre-computed summaries)     │
       │  • User Knowledge Graph (user-specific triples)      │
+      │  • Account Knowledge Graph (per-user domain triples) │
       │  • Vector Store Retriever (semantic past exchanges)  │
       ├─ Session Memory ─────────────────────────────────────┤
       │  • Buffer Window (current conversation messages)     │
@@ -443,14 +445,13 @@ class MemoryManager:
         self.llm = llm
         self._neo4j_driver = neo4j_driver
 
-        # ── GLOBAL MEMORY (shared across all users) ──────────────────────────
+        # ── GLOBAL MEMORY ──────────────────────────────────────────────────────
         self._global_summary = GlobalSummaryMemory()
-        if neo4j_driver and _NEO4J_KG_AVAILABLE:
-            self._global_kg = Neo4jGlobalKnowledgeGraph(neo4j_driver)
-            print("[MemoryManager] Global KG → Neo4j")
-        else:
-            self._global_kg = GlobalKnowledgeGraph()
-            print("[MemoryManager] Global KG → in-memory")
+
+        # ── ACCOUNT-LEVEL KG (per-user, persists across chats) ─────────────
+        # Each user gets their own isolated KG instance.
+        # Dict keyed by user_id; lazy-initialized via _get_global_kg().
+        self._global_kg: Dict[str, Any] = {}
 
         # ── VECTOR STORE (per-user semantic long-term memory) ─────────────────
         self._vector_store = vector_store   # None if not configured
@@ -495,6 +496,7 @@ class MemoryManager:
         _ = self._umem(user_id)
         _ = self._rconv(user_id)
         _ = self._get_kg(user_id)
+        _ = self._get_global_kg(user_id)
         _ = self._smeta(user_id)
         _ = self._csess(user_id)
 
@@ -541,6 +543,17 @@ class MemoryManager:
 
     def _gsess(self, tid: str) -> CurrentSession:
         return self._guest_sessions.setdefault(tid, CurrentSession())
+
+    def _get_global_kg(self, uid: str):
+        """Lazy-init the per-user account-level Knowledge Graph."""
+        if uid not in self._global_kg:
+            if self._neo4j_driver and _NEO4J_KG_AVAILABLE:
+                self._global_kg[uid] = Neo4jGlobalKnowledgeGraph(self._neo4j_driver, uid)
+                print(f"[MemoryManager] Account KG for {uid!r} → Neo4j")
+            else:
+                self._global_kg[uid] = UserAccountKnowledgeGraph()
+                print(f"[MemoryManager] Account KG for {uid!r} → in-memory")
+        return self._global_kg[uid]
 
     # ── Public: build context ─────────────────────────────────────────────────
 
@@ -601,8 +614,8 @@ class MemoryManager:
         if global_summary_block:
             prefix_parts.append(global_summary_block)
 
-        # ── Layer 6 – Global Knowledge Graph (shared) ────────────────────────
-        global_kg_block = self._global_kg.query(tokens)
+        # ── Layer 6 – Account Knowledge Graph (per-user) ──────────────────
+        global_kg_block = self._get_global_kg(user_id).query(tokens)
         if global_kg_block:
             prefix_parts.append(global_kg_block)
 
@@ -657,8 +670,8 @@ class MemoryManager:
             human, assistant, self.llm, source_user=user_id
         )
 
-        # ── Global Knowledge Graph – extract domain triples ──────────────────
-        self._global_kg.extract_and_store(exchange_text, self.llm)
+        # ── Account Knowledge Graph – extract domain triples (per-user) ─────
+        self._get_global_kg(user_id).extract_and_store(exchange_text, self.llm)
 
         # ── Usage counters ───────────────────────────────────────────────────
         self._msg_counts[user_id] = self._msg_counts.get(user_id, 0) + 1
@@ -774,7 +787,7 @@ class MemoryManager:
         base: Dict[str, Any] = {
             # Global memory stats (always present)
             "global_summary_facts":  len(self._global_summary),
-            "global_kg_stats":       self._global_kg.stats(),
+            "global_kg_stats":       self._get_global_kg(user_id).stats() if user_id else {"nodes": 0, "edges": 0},
         }
         if not user_id:
             return base
@@ -897,11 +910,11 @@ class MemoryManager:
             for f in self._global_summary.all_facts()
         ]
 
-    def get_global_kg_edges(self) -> List[Dict[str, str]]:
-        """Return all global knowledge graph triples."""
+    def get_global_kg_edges(self, user_id: str) -> List[Dict[str, str]]:
+        """Return account-level knowledge graph triples for this user."""
         return [
             {"subject": e.source, "relation": e.relation, "object": e.target}
-            for e in self._global_kg.edges
+            for e in self._get_global_kg(user_id).edges
         ]
 
     def get_session_metadata(self, user_id: str) -> Dict[str, Any]:
