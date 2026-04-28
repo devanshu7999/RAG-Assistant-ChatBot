@@ -34,7 +34,7 @@ from psycopg_pool import ConnectionPool
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
 
-from config import (
+from app_config import (
     EMBEDDING_MODEL, GROQ_API_KEY, GROQ_MODEL,
     CHROMA_PATH, COLLECTION_NAME,
     CHUNK_SIZE, CHUNK_OVERLAP,
