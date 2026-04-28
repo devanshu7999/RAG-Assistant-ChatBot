@@ -12,7 +12,7 @@ venv/
 # .venv/
 
 
-config.py
+app_config.py
 
 
 # Data folder (local embeddings / uploads)
