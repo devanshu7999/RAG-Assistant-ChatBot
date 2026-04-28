@@ -6,6 +6,9 @@ Core RAG engine with multi-layer memory integration.
 
 from __future__ import annotations
 
+import sys
+sys.path.insert(0, "/mount/src/rag-assistant-chatbot")
+
 import os
 import re
 import uuid
@@ -30,9 +33,6 @@ from psycopg_pool import ConnectionPool
 
 from sentence_transformers import SentenceTransformer
 from rank_bm25 import BM25Okapi
-
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
     EMBEDDING_MODEL, GROQ_API_KEY, GROQ_MODEL,
