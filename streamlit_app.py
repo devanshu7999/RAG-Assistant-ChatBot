@@ -1,5 +1,5 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import sys
+sys.path.insert(0, "/mount/src/rag-assistant-chatbot")
 # Streamlit UI and session management
 # Features:
 #   - Persistent per-user chat history (survives logout/restart)
