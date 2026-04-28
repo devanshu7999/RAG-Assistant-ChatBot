@@ -21,7 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import chromadb
 from sentence_transformers import SentenceTransformer
 
-from config import VECTOR_MEMORY_TOP_K
+from app_config import VECTOR_MEMORY_TOP_K
 
 
 class VectorMemoryStore:

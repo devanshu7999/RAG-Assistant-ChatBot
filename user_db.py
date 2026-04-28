@@ -63,7 +63,7 @@ from typing import Any, Dict, List, Optional
 import psycopg
 from psycopg.rows import dict_row
 
-from config import DATABASE_URL
+from app_config import DATABASE_URL
 
 
 # ─────────────────────────────────────────────────────────────────────────────

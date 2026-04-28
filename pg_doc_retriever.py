@@ -36,7 +36,7 @@ import psycopg
 from psycopg.rows import dict_row
 from sentence_transformers import SentenceTransformer
 
-from config import DATABASE_URL
+from app_config import DATABASE_URL
 
 # ── Tunable constants ──────────────────────────────────────────────────────────
 # Minimum cosine similarity for a PostgreSQL chunk to be injected as context.

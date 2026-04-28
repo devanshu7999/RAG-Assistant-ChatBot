@@ -26,7 +26,7 @@ from typing import Dict, List, Optional
 from langchain_groq import ChatGroq
 from langchain_core.messages import HumanMessage
 
-from config import MAX_GLOBAL_FACTS
+from app_config import MAX_GLOBAL_FACTS
 
 
 # ─────────────────────────────────────────────────────────────────────────────
