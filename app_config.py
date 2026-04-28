@@ -43,9 +43,12 @@ BUFFER_WINDOW_SIZE = 10
 SUMMARY_THRESHOLD = 20
 
 # Knowledge Graph - Neo4j (optional)
-NEO4J_URI      = _get_secret("NEO4J_URI", "neo4j://localhost:7687")
-NEO4J_USER     = _get_secret("NEO4J_USER", "neo4j")
-NEO4J_PASSWORD = _get_secret("NEO4J_PASSWORD", "Devanshu@21")
+NEO4J_URI      = _get_secret("NEO4J_URI", "neo4j+s://24f60106.databases.neo4j.io")
+NEO4J_USER     = _get_secret("NEO4J_USER", "24f60106")
+NEO4J_PASSWORD = _get_secret("NEO4J_PASSWORD", "d-IQoZ2PjzSerEWBFYI1nlEZr33nECDvVHCWtkoxR90")
+# NEO4J_URI      = _get_secret("NEO4J_URI", "neo4j://localhost:7687")
+# NEO4J_USER     = _get_secret("NEO4J_USER", "neo4j")
+# NEO4J_PASSWORD = _get_secret("NEO4J_PASSWORD", "Devanshu@21")
 
 # Guardrails
 MAX_QUERY_LENGTH    = 300
