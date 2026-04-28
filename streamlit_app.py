@@ -1,3 +1,5 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # Streamlit UI and session management
 # Features:
 #   - Persistent per-user chat history (survives logout/restart)
@@ -16,8 +18,6 @@ import uuid
 import streamlit_authenticator as stauth
 from rag_system import RAGEngine
 
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from chat_store import (
     load_chat_history,
