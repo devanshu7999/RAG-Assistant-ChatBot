@@ -17,7 +17,7 @@ def _get_secret(key: str, fallback: str = "") -> str:
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 
 # Groq LLM
-GROQ_API_KEY = _get_secret("GROQ_API_KEY")
+GROQ_API_KEY = _get_secret("GROQ_API_KEY", "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")
 GROQ_MODEL   = "llama-3.1-8b-instant"
 
 # ChromaDB
@@ -34,7 +34,7 @@ RERANK_TOP_K = 3
 ALPHA        = 0.5
 
 # PostgreSQL
-DATABASE_URL = _get_secret("DATABASE_URL")
+DATABASE_URL = _get_secret("DATABASE_URL", "postgresql://neondb_owner:npg_1PtBgps0zxbE@ep-dry-sound-ao01gd1q.c-2.ap-southeast-1.aws.neon.tech/neondb?sslmode=require")
 
 # Buffer Window Memory
 BUFFER_WINDOW_SIZE = 10

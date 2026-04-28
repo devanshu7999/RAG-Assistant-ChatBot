@@ -76,7 +76,7 @@ class Neo4jKnowledgeGraph:
             return
         try:
             with self._driver.session() as session:
-                session.run(
+                result = session.run(
                     """
                     MERGE (a:Concept {name: $source})
                     MERGE (b:Concept {name: $target})
@@ -87,6 +87,7 @@ class Neo4jKnowledgeGraph:
                     source=s, target=o, relation=relation.strip(),
                     user_id=self._user_id,
                 )
+                result.consume()  # force commit in neo4j driver v6
         except Exception as exc:
             print(f"[Neo4jKG.add] {exc}")
 
@@ -103,8 +104,8 @@ class Neo4jKnowledgeGraph:
                 o = str(t.get("object", "")).strip()
                 if s and r and o:
                     self.add(s, r, o)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[Neo4jKG.extract_and_store] {exc}")
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
@@ -232,7 +233,7 @@ class Neo4jGlobalKnowledgeGraph:
             return
         try:
             with self._driver.session() as session:
-                session.run(
+                result = session.run(
                     """
                     MERGE (a:Concept {name: $source})
                     MERGE (b:Concept {name: $target})
@@ -243,6 +244,7 @@ class Neo4jGlobalKnowledgeGraph:
                     source=s, target=o, relation=relation.strip(),
                     user_id=self._user_id,
                 )
+                result.consume()  # force commit in neo4j driver v6
         except Exception as exc:
             print(f"[Neo4jGlobalKG.add] {exc}")
 
@@ -259,8 +261,8 @@ class Neo4jGlobalKnowledgeGraph:
                 o = str(t.get("object", "")).strip()
                 if s and r and o:
                     self.add(s, r, o)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"[Neo4jGlobalKG.extract_and_store] {exc}")
 
     # ── Queries ───────────────────────────────────────────────────────────────
 
