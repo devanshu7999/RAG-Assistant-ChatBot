@@ -58,6 +58,7 @@ from app_config import (
     BUFFER_WINDOW_SIZE, SUMMARY_THRESHOLD,
 )
 from global_memory import GlobalSummaryMemory, UserAccountKnowledgeGraph
+import user_db  # PostgreSQL persistence for user memory facts
 
 try:
     from neo4j_kg import Neo4jKnowledgeGraph, Neo4jGlobalKnowledgeGraph
@@ -132,6 +133,10 @@ class UserMemory:
       • LLM detects a salient detail  → auto  (confirmed by conversation flow)
 
     All facts are injected into every prompt, every turn.
+
+    Persistence: every mutation (remember / forget) is immediately synced to
+    the ``user_memory_facts`` table in PostgreSQL via ``user_db``.  On first
+    access the facts are loaded from the database so they survive restarts.
     """
 
     _EXTRACT_PROMPT = (
@@ -144,8 +149,55 @@ class UserMemory:
         "Exchange:\nUser: {human}\nAssistant: {assistant}"
     )
 
-    def __init__(self):
+    def __init__(self, user_id: Optional[str] = None):
         self._facts: List[UserFact] = []
+        self._user_id: Optional[str] = user_id  # None → skip DB persistence
+
+    # ── DB sync helpers ──────────────────────────────────────────────────────
+
+    def _persist_fact(self, fact: UserFact) -> None:
+        """Write a single fact to PostgreSQL (no-op for guests / None user_id)."""
+        if not self._user_id:
+            return
+        try:
+            user_db.save_memory_fact(
+                user_id=self._user_id,
+                fact_id=fact.fact_id,
+                text=fact.text,
+                source=fact.source,
+            )
+        except Exception as exc:
+            print(f"[UserMemory._persist_fact] DB write failed: {exc}")
+
+    def _delete_fact_from_db(self, fact_id: str) -> None:
+        """Remove a single fact from PostgreSQL."""
+        if not self._user_id:
+            return
+        try:
+            user_db.delete_memory_fact(self._user_id, fact_id)
+        except Exception as exc:
+            print(f"[UserMemory._delete_fact_from_db] DB delete failed: {exc}")
+
+    def load_from_db(self) -> None:
+        """Hydrate in-memory facts from PostgreSQL.  Called once on init."""
+        if not self._user_id:
+            return
+        try:
+            rows = user_db.load_memory_facts(self._user_id)
+            for row in rows:
+                # Skip duplicates already in memory
+                if any(f.fact_id == row["fact_id"] for f in self._facts):
+                    continue
+                self._facts.append(UserFact(
+                    text=row["text"],
+                    source=row["source"],
+                    created_at=str(row.get("created_at", "")),
+                    fact_id=row["fact_id"],
+                ))
+            if rows:
+                print(f"[UserMemory] Loaded {len(rows)} facts from DB for user={self._user_id!r}")
+        except Exception as exc:
+            print(f"[UserMemory.load_from_db] {exc}")
 
     # Mutations 
     def remember(self, text: str, source: str = "auto") -> UserFact:
@@ -156,21 +208,30 @@ class UserMemory:
                 return f                          # already known
         fact = UserFact(text=text, source=source)
         self._facts.append(fact)
+        self._persist_fact(fact)  # sync to DB
         if len(self._facts) > MAX_USER_FACTS:
             # drop oldest auto facts first
             auto = [f for f in self._facts if f.source == "auto"]
             if auto:
-                self._facts.remove(auto[0])
+                evicted = auto[0]
+                self._facts.remove(evicted)
+                self._delete_fact_from_db(evicted.fact_id)
         return fact
 
     def forget(self, fact_id: str) -> bool:
         before = len(self._facts)
+        removed = [f for f in self._facts if f.fact_id == fact_id]
         self._facts = [f for f in self._facts if f.fact_id != fact_id]
+        for f in removed:
+            self._delete_fact_from_db(f.fact_id)
         return len(self._facts) < before
 
     def forget_by_text(self, text: str) -> bool:
         before = len(self._facts)
+        removed = [f for f in self._facts if text.lower() in f.text.lower()]
         self._facts = [f for f in self._facts if text.lower() not in f.text.lower()]
+        for f in removed:
+            self._delete_fact_from_db(f.fact_id)
         return len(self._facts) < before
 
     def all_facts(self) -> List[UserFact]:
@@ -187,7 +248,7 @@ class UserMemory:
                 return None
             # Sanity: must be a complete sentence, not a question
             if "?" not in raw and len(raw) > 10:
-                self.remember(raw, source="auto")
+                self.remember(raw, source="auto")  # persist handled inside remember()
                 return raw
         except Exception as exc:
             print(f"[UserMemory.try_extract] {exc}")
@@ -519,7 +580,11 @@ class MemoryManager:
     # ── Lazy init ─────────────────────────────────────────────────────────────
 
     def _umem(self, uid: str)  -> UserMemory:
-        return self._user_memory.setdefault(uid, UserMemory())
+        if uid not in self._user_memory:
+            um = UserMemory(user_id=uid)
+            um.load_from_db()  # hydrate from PostgreSQL on first access
+            self._user_memory[uid] = um
+        return self._user_memory[uid]
 
     def _rconv(self, uid: str) -> RecentConversations:
         return self._recent_convs.setdefault(uid, RecentConversations())
